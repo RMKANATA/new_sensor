@@ -1,0 +1,2 @@
+timestamp,hostname,sensor_name,v1,ch2,ch3,dT,dTmax,samples
+2026-08-19 13:20:00,test-host,new01,3.3,25.0,24.0,1.0,1.5,12
