@@ -1,0 +1,19 @@
+[Unit]
+Description=new_sensor Data Post Service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+WorkingDirectory=/home/plant01/new_sensor
+ExecStart=/usr/bin/python3 -u post_data.py
+Restart=always
+RestartSec=10
+TimeoutStartSec=120
+WatchdogSec=180
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

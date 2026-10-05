@@ -1,1 +1,10 @@
 /__pycache__
+*.py[cod]
+*$py.class
+*.tmp
+temp.csv
+logs/
+*.log
+status_*.json
+post_state.json
+data/pending.db*

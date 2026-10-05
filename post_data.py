@@ -3,34 +3,23 @@
 【概要】
 - temp.csv から最新の測定データを読み込み、指定 API エンドポイントに JSON 形式で POST します。
 - 毎分 20 秒のタイミングで 1 分ごとに自動送信します（measure_dT.py の 00 秒測定完了を待って送信）。
-- 送信成功時に日次 CSV (data/配下) にも追記保存します。
-- 前回送信時と同じタイムスタンプのデータは送信をスキップし、重複送信を防ぎます。
-- cron の @reboot や systemd 等で常駐サービスとして実行することを想定しています。
-
-【送信先エンドポイント】
-  https://api.rmkanata.com/data (デフォルト / .env の API_URL で変更可能)
-
-【POST JSON スキーマ】
-  {
-      "hostname": "raspberrypi",
-      "timestamp": "2026-08-19 13:20:00",
-      "sensors": {
-          "new": {
-              "voltage": 3.3,
-              "HS_data": 25.123,
-              "RS_data": 24.567,
-              "dT_data": 0.556,
-              "K_data": 0.123
-          }
-      }
-  }
+- 計測データは POST の成否にかかわらず日次 CSV (data/配下) に無条件保存されます。
+- 送信失敗時は SQLite キュー (data/pending.db) に安全に蓄積され、通信回復時に自動再送されます。
+- 【重要】サーバー側で重複排除を行わない仕様に対応し、ディスク永続化 (post_state.json) を
+  用いて同一タイムスタンプの重複送信をクライアント側で厳格に防止します。
+- cron @reboot や systemd 等で常駐サービスとして実行することを想定しています。
 """
 
+import json
+import logging
 import os
-import sys
 from pathlib import Path
+import socket
+import sys
+import time
+from datetime import datetime, timedelta
 
-# --- 1. カレントディレクトリ移動 & sys.path 追加（最優先で実行） ---
+# --- 1. カレントディレクトリ移動 & sys.path 追加 ---
 BASE_DIR = Path(__file__).resolve().parent
 os.chdir(BASE_DIR)
 if str(BASE_DIR) not in sys.path:
@@ -38,66 +27,81 @@ if str(BASE_DIR) not in sys.path:
 
 # --- 2. 標準ライブラリ ---
 import csv
-import json
-import socket
-import time
-from datetime import datetime, timedelta
 
 # --- 3. サードパーティライブラリ ---
 import requests
 from dotenv import load_dotenv
+load_dotenv()
 
 # --- 4. ローカルモジュール ---
+from common import (
+    sd_notify,
+    seconds_until_next_slot,
+    setup_logger,
+    update_status,
+)
 from save_data import save_data_csv
-
-load_dotenv()
+from send_queue import SendQueue
 
 # ==========================================
 # 設定定数
 # ==========================================
-API_URL     = os.getenv("API_URL", "https://api.rmkanata.com/data")
-SENSOR_NAME = os.getenv("SENSOR_NAME", "new01")
-CSV_PATH    = "temp.csv"
+API_URL         = os.getenv("API_URL", "https://api.rmkanata.com/data")
+SENSOR_NAME     = os.getenv("SENSOR_NAME", "new01")
+CSV_PATH        = BASE_DIR / "temp.csv"
+
+# 再送制御パラメータ
+POST_RESEND_MAX        = int(os.getenv("POST_RESEND_MAX", "30"))         # 1サイクルあたりの最大再送件数
+POST_RESEND_BUDGET_SEC = float(os.getenv("POST_RESEND_BUDGET_SEC", "30.0"))  # 1サイクルの再送時間予算（秒）
+STALE_WARN_MIN         = float(os.getenv("STALE_WARN_MIN", "3.0"))       # temp.csv が何分古ければ警告するか
+
+logger = setup_logger("new_sensor.post", log_file="post.log")
+
 
 # ==========================================
-# グローバル状態管理
+# HTTP セッション管理
 # ==========================================
-_last_posted_timestamp: str | None = None  # 前回送信成功したタイムスタンプ
+_session: requests.Session | None = None
 
 
-def read_latest_csv(filepath: str = CSV_PATH) -> dict | None:
-    """temp.csv の最新データ行を読み込み、辞書形式で返します。
+def get_http_session() -> requests.Session:
+    """コネクションプーリングを有効にした requests.Session を返します。"""
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        _session.headers.update({
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; new_sensor/2.0)",
+        })
+    return _session
 
-    :param filepath: 読み込む CSV ファイルパス
-    :return: カラム名をキーとした辞書、または None
-    """
-    path = Path(filepath)
-    if not path.exists():
-        print(f"[Warn] CSV file not found: {filepath}", flush=True)
+
+def read_latest_csv(filepath: Path | str | None = None) -> dict | None:
+    """temp.csv の最新データ行を読み込み、辞書形式で返します。"""
+    target_path = Path(filepath) if filepath is not None else Path(CSV_PATH)
+    if not target_path.exists():
+        logger.warning(f"CSV file not found: {target_path}")
         return None
 
     try:
-        with open(path, newline="", encoding="utf-8") as f:
+        with open(target_path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             rows = [row for row in reader if any(v.strip() for v in row.values())]
 
         if not rows:
-            print(f"[Warn] No data rows found in {filepath}", flush=True)
+            logger.warning(f"No data rows found in {target_path}")
             return None
 
         return rows[-1]
 
     except Exception as e:
-        print(f"[Error] Failed to read CSV: {e}", flush=True)
+        logger.error(f"Failed to read CSV {target_path}: {e}")
         return None
 
 
-def build_payload(row: dict) -> dict:
-    """CSV 行データから POST 用 JSON ペイロードを組み立てます。
 
-    :param row: temp.csv の行辞書
-    :return: POST ペイロード辞書
-    """
+def build_payload(row: dict) -> dict:
+    """CSV 行データから POST 用 JSON ペイロードを組み立てます。"""
     def to_float(value: str, default: float = 0.0) -> float:
         try:
             return float(value)
@@ -105,7 +109,7 @@ def build_payload(row: dict) -> dict:
             return default
 
     hostname  = row.get("hostname", socket.gethostname())
-    timestamp = row.get("timestamp", "")
+    timestamp = str(row.get("timestamp", "")).strip()
 
     return {
         "hostname": hostname,
@@ -122,130 +126,219 @@ def build_payload(row: dict) -> dict:
     }
 
 
-def post_data(payload: dict, endpoint: str = API_URL) -> bool:
-    """指定されたエンドポイントに JSON データを POST します。
+def execute_post(payload: dict, endpoint: str = API_URL, timeout: tuple = (10, 20)) -> tuple[bool, int | None, str | None]:
+    """指定エンドポイントに JSON データを POST します。
 
-    :param payload: 送信するデータ辞書
+    :param payload: 送信データ辞書
     :param endpoint: POST 先 URL
-    :return: 成功時 True、失敗時 False
+    :param timeout: (connect_timeout, read_timeout)
+    :return: (is_success, http_status_code, error_message)
     """
+    session = get_http_session()
     try:
-        response = requests.post(
-            url=endpoint,
-            json=payload,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0",
-            },
-            timeout=10,
-        )
-        response.raise_for_status()
-        print(
-            f"[OK] POST succeeded | status={response.status_code} | endpoint={endpoint}",
-            flush=True,
-        )
-        return True
+        response = session.post(url=endpoint, json=payload, timeout=timeout)
+        if response.status_code in (200, 201, 204):
+            return True, response.status_code, None
+        else:
+            err_msg = f"HTTP {response.status_code}: {response.text[:200]}"
+            return False, response.status_code, err_msg
 
-    except requests.exceptions.ConnectionError:
-        print(f"[Error] Connection failed: {endpoint}", flush=True)
-    except requests.exceptions.Timeout:
-        print(f"[Error] Request timed out: {endpoint}", flush=True)
-    except requests.exceptions.HTTPError as e:
-        print(f"[Error] HTTP error: {e}", flush=True)
+    except requests.exceptions.ConnectionError as e:
+        return False, None, f"ConnectionError: {e}"
+    except requests.exceptions.Timeout as e:
+        return False, None, f"Timeout: {e}"
     except requests.exceptions.RequestException as e:
-        print(f"[Error] Request failed: {e}", flush=True)
+        return False, None, f"RequestException: {e}"
+    except Exception as e:
+        return False, None, f"UnexpectedError: {e}"
 
-    return False
+
+def check_data_staleness(timestamp_str: str) -> None:
+    """temp.csv のタイムスタンプが古い場合に警告を出力します。"""
+    if not timestamp_str:
+        return
+    try:
+        data_dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+        age_seconds = (datetime.now() - data_dt).total_seconds()
+        age_minutes = age_seconds / 60.0
+        if age_minutes >= STALE_WARN_MIN:
+            logger.warning(
+                f"[STALE] temp.csv timestamp '{timestamp_str}' is {age_minutes:.1f} minutes old. "
+                f"measure_dT.py may not be running or ADC is unresponsive."
+            )
+    except Exception:
+        pass
 
 
-def post_cycle() -> bool:
+def post_cycle(queue: SendQueue, csv_path: Path | str | None = None) -> dict:
     """1回分のデータ送信・保存サイクルを実行します。
 
     1. temp.csv から最新データを読み込む
-    2. 前回送信時と同じタイムスタンプの場合はスキップする
-    3. ペイロードを組み立てる
-    4. API に POST する
-    5. 日次 CSV に保存する
-
-    :return: 成功時 True、スキップまたは失敗時 False
+    2. 新規データがあれば、まず日次 CSV に無条件保存（欠測防止）
+    3. 既に送信済みタイムスタンプの場合は送信スキップ（重複送信の絶対防止）
+    4. 最新データを POST 送信
+       - 成功: 送信済みタイムスタンプを永続化、キュー内の過去データを再送
+       - 失敗: キューに蓄積
     """
-    global _last_posted_timestamp
+    cycle_result = {
+        "status": "idle",
+        "timestamp": None,
+        "posted": False,
+        "error": None,
+        "http_status": None,
+    }
 
-    row = read_latest_csv()
+    row = read_latest_csv(csv_path)
     if row is None:
-        print("[Warn] Skipping cycle: No valid data in temp.csv", flush=True)
-        return False
+        logger.warning("[Warn] Skipping cycle: No valid data in temp.csv")
+        cycle_result["error"] = "No valid data in temp.csv"
+        return cycle_result
 
-    current_timestamp = row.get("timestamp", "")
 
-    # 前回送信データと同一（更新されていない）の場合はスキップ
-    if current_timestamp and current_timestamp == _last_posted_timestamp:
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(
-            f"[{now_str}] Skipping cycle: Data already sent (timestamp: {current_timestamp})",
-            flush=True,
-        )
-        return False
+    current_timestamp = str(row.get("timestamp", "")).strip()
+    cycle_result["timestamp"] = current_timestamp
 
+    # stale 判定
+    check_data_staleness(current_timestamp)
+
+    # 1. ローカル日次CSVへの無条件保存（POST成否に関係なく保存）
+    save_data_csv(row)
+
+    # 2. 重複チェック（既に送信済みのタイムスタンプなら送信スキップ）
+    if queue.is_already_posted(current_timestamp):
+        logger.info(f"Skipping POST: Data for timestamp '{current_timestamp}' was already sent.")
+        cycle_result["status"] = "already_posted"
+        return cycle_result
+
+    # 3. 最新データのペイロード作成と POST
     payload = build_payload(row)
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now_str}] Posting measurement data (timestamp: {current_timestamp})...", flush=True)
-    print(f"       Payload: {json.dumps(payload, ensure_ascii=False)}", flush=True)
+    logger.info(f"Posting measurement data (timestamp: {current_timestamp})...")
+    logger.debug(f"Payload: {json.dumps(payload, ensure_ascii=False)}")
 
-    # POST 送信
-    success = post_data(payload)
+    success, status_code, err_msg = execute_post(payload)
+    cycle_result["http_status"] = status_code
+    cycle_result["error"] = err_msg
 
     if success:
-        # 送信成功時のみタイムスタンプを記録（通信失敗時は次回リトライ可能にする）
-        _last_posted_timestamp = current_timestamp
-        # 日次 CSV に保存
-        save_data_csv(row)
+        logger.info(f"[OK] POST succeeded | status={status_code} | timestamp={current_timestamp}")
+        queue.mark_as_posted(current_timestamp)
+        cycle_result["posted"] = True
+        cycle_result["status"] = "success"
 
-    return success
+        # 4. キューに溜まっている未送信データの再送処理
+        resend_pending_data(queue)
+
+    else:
+        logger.error(f"[Error] POST failed | status={status_code} | error={err_msg}")
+        # 未送信キューに登録
+        queue.enqueue(current_timestamp, payload)
+        cycle_result["status"] = "failed"
+
+    return cycle_result
+
+
+def resend_pending_data(queue: SendQueue) -> None:
+    """キューに蓄積された過去の未送信データを古い順に再送します。"""
+    pending_items = queue.fetch_pending(limit=POST_RESEND_MAX)
+    if not pending_items:
+        return
+
+    logger.info(f"[Resend] Starting backlog resend for {len(pending_items)} items...")
+    start_time = time.time()
+    sent_count = 0
+
+    for row_id, ts, payload in pending_items:
+        # 時間予算チェック
+        if time.time() - start_time > POST_RESEND_BUDGET_SEC:
+            logger.warning(f"[Resend] Time budget ({POST_RESEND_BUDGET_SEC}s) reached. Postponing remaining items.")
+            break
+
+        # 再送実行
+        success, status_code, err_msg = execute_post(payload)
+        if success:
+            logger.info(f"[Resend OK] Resent timestamp={ts} | status={status_code}")
+            queue.remove(ts)
+            sent_count += 1
+        else:
+            logger.warning(f"[Resend Failed] timestamp={ts} | status={status_code} | error={err_msg}. Aborting resend.")
+            queue.record_attempt_failure(ts, err_msg or "Unknown error")
+            break  # 1つ失敗したら通信状態が悪いと判断し、残りは次回に回す
+
+    logger.info(f"[Resend] Completed. Successfully resent {sent_count} items. Remaining queue: {queue.get_pending_count()}")
 
 
 # ==========================================
 # メイン処理 (1分周期・20秒実行ループ)
 # ==========================================
-if __name__ == "__main__":
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now_str}] Starting new_sensor post service...", flush=True)
-    print(f"  Endpoint    : {API_URL}", flush=True)
-    print(f"  Sensor Name : {SENSOR_NAME}", flush=True)
-    print(f"  CSV path    : {CSV_PATH}", flush=True)
+def main_loop():
+    logger.info("Starting new_sensor post service...")
+    logger.info(f"  Endpoint    : {API_URL}")
+    logger.info(f"  Sensor Name : {SENSOR_NAME}")
+    logger.info(f"  CSV path    : {CSV_PATH}")
 
     if not API_URL:
-        print("[Error] API_URL is not set in .env", flush=True)
+        logger.error("API_URL is not set in .env")
         sys.exit(1)
 
-    # --- 初回待機処理（直近の「20秒」に合わせて開始） ---
-    now = datetime.now()
-    if now.second < 20:
-        target_time = now.replace(second=20, microsecond=0)
-    else:
-        target_time = (now + timedelta(minutes=1)).replace(second=20, microsecond=0)
+    # 送信キューおよび送信済み状態マネージャ初期化
+    queue = SendQueue()
 
-    initial_sleep = (target_time - now).total_seconds()
-    print(
-        f"Waiting {initial_sleep:.1f}s until first post at {target_time.strftime('%H:%M:%S')}...",
-        flush=True,
-    )
-    if initial_sleep > 0:
-        time.sleep(initial_sleep)
+    # systemd に準備完了を通知
+    sd_notify("READY=1")
 
-    try:
-        while True:
+    consecutive_failures = 0
+    last_post_ok_at: str | None = None
+
+    status_data = {
+        "service": "post",
+        "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "last_post_ok_at": None,
+        "last_http_status": None,
+        "consecutive_failures": 0,
+        "pending_count": queue.get_pending_count(),
+        "status": "running",
+    }
+    update_status("status_post.json", status_data)
+
+    while True:
+        try:
+            # 毎分 20 秒に合わせて待機 (offset=20, period=60)
+            wait_sec = seconds_until_next_slot(offset_sec=20.0, period_sec=60.0, min_gap=0.5)
+            logger.debug(f"Sleeping {wait_sec:.1f}s until next post slot (:20)...")
+            time.sleep(wait_sec)
+
             # 送信サイクルを実行
-            post_cycle()
+            result = post_cycle(queue)
 
-            # --- 次回送信時刻 (次の分 20秒) の計算と待機 ---
-            next_target_time = target_time + timedelta(minutes=1)
-            sleep_sec = (next_target_time - datetime.now()).total_seconds()
+            if result["posted"]:
+                consecutive_failures = 0
+                last_post_ok_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            elif result["status"] == "failed":
+                consecutive_failures += 1
+                logger.warning(f"[Failure Streak] Consecutive post failures: {consecutive_failures}")
 
-            if sleep_sec > 0:
-                time.sleep(sleep_sec)
+            # 状態ファイル更新
+            status_data.update({
+                "last_post_ok_at": last_post_ok_at,
+                "last_http_status": result.get("http_status"),
+                "last_error": result.get("error"),
+                "consecutive_failures": consecutive_failures,
+                "pending_count": queue.get_pending_count(),
+                "status": "warning" if consecutive_failures > 0 else "running",
+            })
+            update_status("status_post.json", status_data)
 
-            target_time = next_target_time
+            # systemd 管理下であればループ生存を通知
+            sd_notify("WATCHDOG=1")
 
-    except KeyboardInterrupt:
-        print("\nPost service stopped by user.", flush=True)
+        except KeyboardInterrupt:
+            logger.info("Post service stopped by user.")
+            break
+        except Exception as e:
+            # cron @reboot 等で予期せぬ例外が出ても絶対にプロセスを落とさない
+            logger.error(f"[Main Loop Error] Unexpected exception in post loop: {e}", exc_info=True)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main_loop()

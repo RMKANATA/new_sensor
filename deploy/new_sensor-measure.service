@@ -1,0 +1,18 @@
+[Unit]
+Description=new_sensor ADC Measurement Service
+After=local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+WorkingDirectory=/home/plant01/new_sensor
+ExecStart=/usr/bin/python3 -u measure_dT.py
+Restart=always
+RestartSec=10
+TimeoutStartSec=120
+WatchdogSec=120
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
